@@ -26,6 +26,137 @@ func choose[T any](negate bool, with, without func(...T) types.FilterOption) fun
 	return with
 }
 
+// valueFilter pairs the include and exclude constructors for one query type.
+type valueFilter[T any] struct {
+	with    func(...T) types.FilterOption
+	without func(...T) types.FilterOption
+}
+
+// stringFilter additionally says how the raw query value is conditioned.
+type stringFilter struct {
+	valueFilter[string]
+
+	// normalize is applied before the value reaches the filter; nil passes it
+	// through.
+	normalize func(string) string
+
+	// skipEmpty drops values that are blank once trimmed. Not universal: the
+	// older query types accept a blank value and keep doing so, since a filter
+	// that silently disappears would be a behaviour change.
+	skipEmpty bool
+}
+
+// stringFilters, uintFilters and boolFilters hold the query types whose
+// handling is mechanical, keeping the switch in QueryToFilters down to the
+// cases that actually parse something.
+var stringFilters = map[searchv1.RecordQueryType]stringFilter{
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_NAME: {
+		valueFilter: valueFilter[string]{types.WithNames, types.WithoutNames},
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_VERSION: {
+		valueFilter: valueFilter[string]{types.WithVersions, types.WithoutVersions},
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_SKILL_NAME: {
+		valueFilter: valueFilter[string]{types.WithSkillNames, types.WithoutSkillNames},
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_DOMAIN_NAME: {
+		valueFilter: valueFilter[string]{types.WithDomainNames, types.WithoutDomainNames},
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_CREATED_AT: {
+		valueFilter: valueFilter[string]{types.WithCreatedAts, types.WithoutCreatedAts},
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_AUTHOR: {
+		valueFilter: valueFilter[string]{types.WithAuthors, types.WithoutAuthors},
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_SCHEMA_VERSION: {
+		valueFilter: valueFilter[string]{types.WithSchemaVersions, types.WithoutSchemaVersions},
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_MODULE_NAME: {
+		valueFilter: valueFilter[string]{types.WithModuleNames, types.WithoutModuleNames},
+		skipEmpty:   true,
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_DESCRIPTION: {
+		valueFilter: valueFilter[string]{types.WithDescriptions, types.WithoutDescriptions},
+		skipEmpty:   true,
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_SCAN_SEVERITY: {
+		valueFilter: valueFilter[string]{types.WithScanSeverities, types.WithoutScanSeverities},
+		// Stored as the proto enum name suffix, which is upper case.
+		normalize: strings.ToUpper,
+		skipEmpty: true,
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_SCAN_STATUS: {
+		valueFilter: valueFilter[string]{types.WithScanStatuses, types.WithoutScanStatuses},
+		// Stored lowercase-hyphen. Matching is case-insensitive anyway, so
+		// this only normalises what reaches a log line.
+		normalize: strings.ToLower,
+		skipEmpty: true,
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_SCAN_FAILURE_REASON: {
+		valueFilter: valueFilter[string]{types.WithScanFailureReasons, types.WithoutScanFailureReasons},
+		normalize:   strings.ToLower,
+		skipEmpty:   true,
+	},
+}
+
+var uintFilters = map[searchv1.RecordQueryType]struct {
+	valueFilter[uint64]
+
+	// label names the field in the parse error; the type's own String() is the
+	// unwieldy RECORD_QUERY_TYPE_ form.
+	label string
+}{
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_SKILL_ID: {
+		valueFilter[uint64]{types.WithSkillIDs, types.WithoutSkillIDs}, "skill ID",
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_DOMAIN_ID: {
+		valueFilter[uint64]{types.WithDomainIDs, types.WithoutDomainIDs}, "domain ID",
+	},
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_MODULE_ID: {
+		valueFilter[uint64]{types.WithModuleIDs, types.WithoutModuleIDs}, "module ID",
+	},
+}
+
+// boolFilters have no separate exclude constructor: negation flips the value.
+var boolFilters = map[searchv1.RecordQueryType]func(bool) types.FilterOption{
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_VERIFIED:  types.WithVerified,
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_TRUSTED:   types.WithTrusted,
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_SCAN_SAFE: types.WithScanSafe,
+}
+
+// tableFilter resolves a query against the lookup tables above. Returns
+// ok=false for a type that is not table-driven, and ok=true with a nil option
+// for a recognised type whose value was dropped.
+func tableFilter(query *searchv1.RecordQuery) (types.FilterOption, bool, error) {
+	if f, found := stringFilters[query.GetType()]; found {
+		value := query.GetValue()
+		if f.skipEmpty && strings.TrimSpace(value) == "" {
+			return nil, true, nil
+		}
+
+		if f.normalize != nil {
+			value = f.normalize(value)
+		}
+
+		return choose(query.GetNegate(), f.with, f.without)(value), true, nil
+	}
+
+	if f, found := uintFilters[query.GetType()]; found {
+		parsed, err := strconv.ParseUint(query.GetValue(), 10, 64)
+		if err != nil {
+			return nil, true, fmt.Errorf("failed to parse %s %q: %w", f.label, query.GetValue(), err)
+		}
+
+		return choose(query.GetNegate(), f.with, f.without)(parsed), true, nil
+	}
+
+	if f, found := boolFilters[query.GetType()]; found {
+		return f(strings.EqualFold(query.GetValue(), "true") != query.GetNegate()), true, nil
+	}
+
+	return nil, false, nil
+}
+
 // ParseComparisonOperator parses a value that may have an operator prefix (>=, >, <=, <, =).
 // Returns the operator and the actual value. If no operator prefix, returns empty operator.
 func ParseComparisonOperator(value string) (string, string) {
@@ -107,150 +238,116 @@ func BuildComparisonConditions(column string, values []string) (string, []any) {
 	return strings.Join(allConditions, " OR "), allArgs
 }
 
-func QueryToFilters(queries []*searchv1.RecordQuery) ([]types.FilterOption, error) { //nolint:gocognit,cyclop,gocyclo
+// structuredFilters are the query types whose value has to be taken apart
+// rather than passed through.
+var structuredFilters = map[searchv1.RecordQueryType]func(*searchv1.RecordQuery) []types.FilterOption{
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_LOCATOR:    locatorFilters,
+	searchv1.RecordQueryType_RECORD_QUERY_TYPE_ANNOTATION: annotationFilters,
+}
+
+// locatorFilters splits a locator query into its type and URL parts.
+//
+// Nominally "type:url", but a wildcard may stand in for either half and a bare
+// value may be either one, so the shape has to be inferred.
+func locatorFilters(query *searchv1.RecordQuery) []types.FilterOption {
+	l := strings.SplitN(query.GetValue(), ":", 2) //nolint:mnd
+
+	locatorTypesFn := choose(query.GetNegate(), types.WithLocatorTypes, types.WithoutLocatorTypes)
+	locatorURLsFn := choose(query.GetNegate(), types.WithLocatorURLs, types.WithoutLocatorURLs)
+
+	if len(l) == 1 {
+		// A leading wildcard means the whole value is a URL pattern.
+		// Example: "*marketing-strategy"
+		if strings.HasPrefix(l[0], "*") {
+			return []types.FilterOption{locatorURLsFn(l[0])}
+		}
+
+		if strings.TrimSpace(l[0]) != "" {
+			return []types.FilterOption{locatorTypesFn(l[0])}
+		}
+
+		return nil
+	}
+
+	// A "//" after the colon makes it a scheme separator, so a wildcard before
+	// it is a wildcard scheme and the whole value is one URL pattern.
+	// Example: "*://ghcr.io/agntcy/marketing-strategy"
+	if strings.HasPrefix(l[1], "//") && strings.HasPrefix(l[0], "*") {
+		return []types.FilterOption{locatorURLsFn(query.GetValue())}
+	}
+
+	var options []types.FilterOption
+
+	if strings.TrimSpace(l[0]) != "" {
+		options = append(options, locatorTypesFn(l[0]))
+	}
+
+	if strings.TrimSpace(l[1]) != "" {
+		options = append(options, locatorURLsFn(l[1]))
+	}
+
+	return options
+}
+
+// annotationFilters splits a "key:value" annotation query. A bare key matches
+// any value.
+func annotationFilters(query *searchv1.RecordQuery) []types.FilterOption {
+	parts := strings.SplitN(query.GetValue(), ":", 2) //nolint:mnd
+
+	keysFn := choose(query.GetNegate(), types.WithAnnotationKeys, types.WithoutAnnotationKeys)
+	valuesFn := choose(query.GetNegate(), types.WithAnnotationValues, types.WithoutAnnotationValues)
+
+	if len(parts) == 1 {
+		return []types.FilterOption{keysFn(parts[0])}
+	}
+
+	if parts[0] == "" {
+		logger.Warn("Annotation query has empty key, skipping", "value", query.GetValue())
+
+		return nil
+	}
+
+	options := []types.FilterOption{keysFn(parts[0])}
+
+	if parts[1] != "" {
+		options = append(options, valuesFn(parts[1]))
+	}
+
+	return options
+}
+
+// QueryToFilters translates search queries into database filter options.
+func QueryToFilters(queries []*searchv1.RecordQuery) ([]types.FilterOption, error) {
 	var options []types.FilterOption
 
 	for _, query := range queries {
-		switch query.GetType() {
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_UNSPECIFIED:
+		option, handled, err := tableFilter(query)
+		if err != nil {
+			return nil, err
+		}
+
+		if handled {
+			if option != nil {
+				options = append(options, option)
+			}
+
+			continue
+		}
+
+		if parse, found := structuredFilters[query.GetType()]; found {
+			options = append(options, parse(query)...)
+
+			continue
+		}
+
+		if query.GetType() == searchv1.RecordQueryType_RECORD_QUERY_TYPE_UNSPECIFIED {
 			logger.Warn("Unspecified query type, skipping", "query", query)
 
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_NAME:
-			options = append(options, choose(query.GetNegate(), types.WithNames, types.WithoutNames)(query.GetValue()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_VERSION:
-			options = append(options, choose(query.GetNegate(), types.WithVersions, types.WithoutVersions)(query.GetValue()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_SKILL_ID:
-			u64, err := strconv.ParseUint(query.GetValue(), 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse skill ID %q: %w", query.GetValue(), err)
-			}
-
-			options = append(options, choose(query.GetNegate(), types.WithSkillIDs, types.WithoutSkillIDs)(u64))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_SKILL_NAME:
-			options = append(options, choose(query.GetNegate(), types.WithSkillNames, types.WithoutSkillNames)(query.GetValue()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_LOCATOR:
-			l := strings.SplitN(query.GetValue(), ":", 2) //nolint:mnd
-
-			locatorTypesFn := choose(query.GetNegate(), types.WithLocatorTypes, types.WithoutLocatorTypes)
-			locatorURLsFn := choose(query.GetNegate(), types.WithLocatorURLs, types.WithoutLocatorURLs)
-
-			// If the type starts with a wildcard, treat it as a URL pattern
-			// Example: "*marketing-strategy"
-			if len(l) == 1 && strings.HasPrefix(l[0], "*") {
-				options = append(options, locatorURLsFn(l[0]))
-
-				break
-			}
-
-			if len(l) == 1 && strings.TrimSpace(l[0]) != "" {
-				options = append(options, locatorTypesFn(l[0]))
-
-				break
-			}
-
-			// If the prefix is //, check if the part before : is a wildcard
-			// If it's a wildcard (like "*"), treat the whole thing as a URL pattern
-			// If it's not a wildcard (like "docker-image"), treat as type:url format
-			// Example: "*://ghcr.io/agntcy/marketing-strategy" -> pure URL pattern
-			if len(l) == 2 && strings.HasPrefix(l[1], "//") && strings.HasPrefix(l[0], "*") {
-				options = append(options, locatorURLsFn(query.GetValue()))
-
-				break
-			}
-
-			if len(l) == 2 { //nolint:mnd
-				if strings.TrimSpace(l[0]) != "" {
-					options = append(options, locatorTypesFn(l[0]))
-				}
-
-				if strings.TrimSpace(l[1]) != "" {
-					options = append(options, locatorURLsFn(l[1]))
-				}
-			}
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_MODULE_NAME:
-			if strings.TrimSpace(query.GetValue()) != "" {
-				options = append(options, choose(query.GetNegate(), types.WithModuleNames, types.WithoutModuleNames)(query.GetValue()))
-			}
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_DOMAIN_ID:
-			u64, err := strconv.ParseUint(query.GetValue(), 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse domain ID %q: %w", query.GetValue(), err)
-			}
-
-			options = append(options, choose(query.GetNegate(), types.WithDomainIDs, types.WithoutDomainIDs)(u64))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_DOMAIN_NAME:
-			options = append(options, choose(query.GetNegate(), types.WithDomainNames, types.WithoutDomainNames)(query.GetValue()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_CREATED_AT:
-			options = append(options, choose(query.GetNegate(), types.WithCreatedAts, types.WithoutCreatedAts)(query.GetValue()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_AUTHOR:
-			options = append(options, choose(query.GetNegate(), types.WithAuthors, types.WithoutAuthors)(query.GetValue()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_SCHEMA_VERSION:
-			options = append(options, choose(query.GetNegate(), types.WithSchemaVersions, types.WithoutSchemaVersions)(query.GetValue()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_MODULE_ID:
-			u64, err := strconv.ParseUint(query.GetValue(), 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse module ID %q: %w", query.GetValue(), err)
-			}
-
-			options = append(options, choose(query.GetNegate(), types.WithModuleIDs, types.WithoutModuleIDs)(u64))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_VERIFIED:
-			options = append(options, types.WithVerified(strings.EqualFold(query.GetValue(), "true") != query.GetNegate()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_TRUSTED:
-			options = append(options, types.WithTrusted(strings.EqualFold(query.GetValue(), "true") != query.GetNegate()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_ANNOTATION:
-			parts := strings.SplitN(query.GetValue(), ":", 2) //nolint:mnd
-
-			keysFn := choose(query.GetNegate(), types.WithAnnotationKeys, types.WithoutAnnotationKeys)
-			valuesFn := choose(query.GetNegate(), types.WithAnnotationValues, types.WithoutAnnotationValues)
-
-			if len(parts) == 1 {
-				// No colon — treat entire value as annotation key (match any value)
-				options = append(options, keysFn(parts[0]))
-			} else {
-				key := parts[0]
-				if key == "" {
-					logger.Warn("Annotation query has empty key, skipping", "value", query.GetValue())
-
-					break
-				}
-
-				options = append(options, keysFn(key))
-
-				if parts[1] != "" {
-					options = append(options, valuesFn(parts[1]))
-				}
-			}
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_SCAN_SEVERITY:
-			if query.GetValue() != "" {
-				options = append(options, choose(query.GetNegate(), types.WithScanSeverities, types.WithoutScanSeverities)(strings.ToUpper(query.GetValue())))
-			}
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_SCAN_SAFE:
-			options = append(options, types.WithScanSafe(strings.EqualFold(query.GetValue(), "true") != query.GetNegate()))
-
-		case searchv1.RecordQueryType_RECORD_QUERY_TYPE_DESCRIPTION:
-			if strings.TrimSpace(query.GetValue()) != "" {
-				options = append(options, choose(query.GetNegate(), types.WithDescriptions, types.WithoutDescriptions)(query.GetValue()))
-			}
-
-		default:
-			logger.Warn("Unknown query type", "type", query.GetType())
+			continue
 		}
+
+		// Reached when a newer client sends a type this server predates.
+		logger.Warn("Unknown query type", "type", query.GetType())
 	}
 
 	return options, nil
