@@ -24,8 +24,8 @@ require (
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/sigstore/sigstore v1.10.9
 	github.com/spf13/viper v1.21.0
-	github.com/stretchr/testify v1.12.0
-	google.golang.org/grpc v1.83.1
+	github.com/stretchr/testify v1.12.1
+	google.golang.org/grpc v1.83.2
 	gopkg.in/yaml.v3 v3.0.1
 	oras.land/oras-go/v2 v2.6.2
 )
@@ -166,7 +166,7 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/shibumi/go-pathspec v1.3.0 // indirect
 	github.com/sigstore/cosign/v3 v3.1.3 // indirect
-	github.com/sigstore/protobuf-specs v0.5.1 // indirect
+	github.com/sigstore/protobuf-specs v0.5.2 // indirect
 	github.com/sigstore/rekor v1.5.3 // indirect
 	github.com/sigstore/rekor-tiles/v2 v2.3.0 // indirect
 	github.com/sigstore/sigstore-go v1.3.0 // indirect
